@@ -15,13 +15,15 @@ amp_eqspin_indx = 8
 amp_uneqspin_indx = 36
 
 
-def get_inspiral_phase(
-    fM_s: Float[Array, " n_freq"] | FloatLike,
+def _get_inspiral_phase_coeffs(
     theta: Float[Array, "4"],
     phase_coeffs: Float[Array, "13 49"],
-) -> Float[Array, " n_freq"] | FloatLike:
+):
     """
-    Calculate the inspiral phase for the IMRPhenomD waveform.
+    Compute the inspiral PN phase coefficients (phi0..phi8L) and the pseudo-PN
+    coefficients (sigma1..sigma4) from the collocation-point construction. These
+    scalars fully determine both the inspiral phase and its analytic frequency
+    derivative.
     """
     m1, m2, chi1, chi2 = theta
     m1_s = m1 * MTSUN
@@ -311,6 +313,56 @@ def get_inspiral_phase(
     sigma3 = (-5.0 / 5.0) * coeffs_Ins[2]
     sigma4 = (-5.0 / 6.0) * coeffs_Ins[3]
 
+    phiN = -(3.0 * PI ** (-5.0 / 3.0)) / 128.0
+    return (
+        phiN,
+        phi0,
+        phi1,
+        phi2,
+        phi3,
+        phi4,
+        phi5,
+        phi5L,
+        phi6,
+        phi6L,
+        phi7,
+        phi8,
+        phi8L,
+        sigma1,
+        sigma2,
+        sigma3,
+        sigma4,
+    )
+
+
+def get_inspiral_phase(
+    fM_s: Float[Array, " n_freq"] | FloatLike,
+    theta: Float[Array, "4"],
+    phase_coeffs: Float[Array, "13 49"],
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Calculate the inspiral phase for the IMRPhenomXAS waveform.
+    """
+    (
+        phiN,
+        phi0,
+        phi1,
+        phi2,
+        phi3,
+        phi4,
+        phi5,
+        phi5L,
+        phi6,
+        phi6L,
+        phi7,
+        phi8,
+        phi8L,
+        sigma1,
+        sigma2,
+        sigma3,
+        sigma4,
+    ) = _get_inspiral_phase_coeffs(theta, phase_coeffs)
+
     f13 = fM_s ** (1.0 / 3.0)
     f23 = f13 * f13
     f43 = fM_s * f13
@@ -340,19 +392,22 @@ def get_inspiral_phase(
 
     phi_Ins = phi_TF2 + (sigma1 * f83 + sigma2 * f3 + sigma3 * f103 + sigma4 * f113)
 
-    phiN = -(3.0 * PI ** (-5.0 / 3.0)) / 128.0
     return phi_Ins * phiN / f53
 
 
-def get_intermediate_raw_phase(
-    fM_s: Float[Array, " n_freq"] | FloatLike,
+def _get_intermediate_raw_phase_coeffs(
     theta: Float[Array, "4"],
     phase_coeffs: Float[Array, "13 49"],
     dPhaseIN: FloatLike,
     dPhaseRD: FloatLike,
     cL: FloatLike,
     chip: FloatLike = 0.0,
-) -> Float[Array, " n_freq"] | FloatLike:
+):
+    """
+    Compute the intermediate-phase polynomial coefficients (b0..b4) from the
+    5-point collocation construction. Together with cL, fMs_RD and fMs_damp they
+    determine the intermediate phase and its analytic frequency derivative.
+    """
     m1, m2, chi1, chi2 = theta
     m1_s = m1 * MTSUN
     m2_s = m2 * MTSUN
@@ -552,6 +607,22 @@ def get_intermediate_raw_phase(
     b3 = coeffs_Int[3] * fMs_RD**3
     b4 = coeffs_Int[4] * fMs_RD**4
 
+    return (b0, b1, b2, b3, b4, fMs_RD, fMs_damp)
+
+
+def get_intermediate_raw_phase(
+    fM_s: Float[Array, " n_freq"] | FloatLike,
+    theta: Float[Array, "4"],
+    phase_coeffs: Float[Array, "13 49"],
+    dPhaseIN: FloatLike,
+    dPhaseRD: FloatLike,
+    cL: FloatLike,
+    chip: FloatLike = 0.0,
+) -> Float[Array, " n_freq"] | FloatLike:
+    b0, b1, b2, b3, b4, fMs_RD, fMs_damp = _get_intermediate_raw_phase_coeffs(
+        theta, phase_coeffs, dPhaseIN, dPhaseRD, cL, chip
+    )
+
     return (
         b0 * fM_s
         + b1 * jnp.log(fM_s)
@@ -562,12 +633,16 @@ def get_intermediate_raw_phase(
     )
 
 
-def get_mergerringdown_raw_phase(
-    fM_s: Float[Array, " n_freq"] | FloatLike,
+def _get_mergerringdown_raw_phase_coeffs(
     theta: Float[Array, "4"],
     phase_coeffs: Float[Array, "13 49"],
     chip: FloatLike = 0.0,
-) -> tuple[Float[Array, " n_freq"], tuple[FloatLike, FloatLike]]:
+):
+    """
+    Compute the merger-ringdown phase coefficients (c0, c1, c2, c4, cL) from the
+    5-point collocation construction. Together with fMs_RD and fMs_damp they
+    determine the raw merger-ringdown phase and its analytic derivative.
+    """
     m1, m2, chi1, chi2 = theta
     m1_s = m1 * MTSUN
     m2_s = m2 * MTSUN
@@ -726,6 +801,19 @@ def get_mergerringdown_raw_phase(
     coeffs_RD = jnp.linalg.solve(A, b)
     c0, c1, c2, c4, cRD = coeffs_RD
     cL = -(dphase0 * cRD)
+
+    return (c0, c1, c2, c4, cL, CV_phase_RD0, fMs_RD, fMs_damp)
+
+
+def get_mergerringdown_raw_phase(
+    fM_s: Float[Array, " n_freq"] | FloatLike,
+    theta: Float[Array, "4"],
+    phase_coeffs: Float[Array, "13 49"],
+    chip: FloatLike = 0.0,
+) -> tuple[Float[Array, " n_freq"], tuple[FloatLike, FloatLike]]:
+    c0, c1, c2, c4, cL, CV_phase_RD0, fMs_RD, fMs_damp = (
+        _get_mergerringdown_raw_phase_coeffs(theta, phase_coeffs, chip)
+    )
     c4ov3 = c4 / 3.0
     cLovfda = cL / fMs_damp
 
@@ -738,6 +826,159 @@ def get_mergerringdown_raw_phase(
     )
 
     return phiRD, (cL, CV_phase_RD0)
+
+
+def _fractional_powers(
+    fM_s: Float[Array, " n_freq"] | FloatLike,
+):
+    """
+    Fractional powers and log of fM_s shared by the three analytic
+    phase-derivative pieces, evaluated once for the whole grid.
+
+    Returns (x, x^(1/3), x^(2/3), x^-1, x^-2, x^-3, x^-4, x^(-1/3), x^(-2/3),
+             x^(-4/3), x^(-5/3), x^(-7/3), x^(-8/3), log(x)).
+    """
+    x = fM_s
+    x_13 = x ** (1.0 / 3.0)
+    x_23 = x_13 * x_13
+    inv_x = 1.0 / x
+    inv_x2 = inv_x * inv_x
+    inv_x3 = inv_x2 * inv_x
+    inv_x4 = inv_x2 * inv_x2
+    inv_x_13 = 1.0 / x_13
+    inv_x_23 = 1.0 / x_23
+    inv_x_43 = inv_x * inv_x_13
+    inv_x_53 = inv_x * inv_x_23
+    inv_x_73 = inv_x2 * inv_x_13
+    inv_x_83 = inv_x2 * inv_x_23
+    log_x = jnp.log(x)
+    return (
+        x,
+        x_13,
+        x_23,
+        inv_x,
+        inv_x2,
+        inv_x3,
+        inv_x4,
+        inv_x_13,
+        inv_x_23,
+        inv_x_43,
+        inv_x_53,
+        inv_x_73,
+        inv_x_83,
+        log_x,
+    )
+
+
+def _inspiral_d_phase(
+    powers,
+    insp_coeffs,
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Analytic derivative d(Phi_Ins)/d(fM_s) of get_inspiral_phase, computed
+    directly from the PN coefficients and the pseudo-PN sigma coefficients.
+    Takes the shared power bundle from _fractional_powers.
+    """
+    (
+        phiN,
+        phi0,
+        phi1,
+        phi2,
+        phi3,
+        phi4,
+        phi5,
+        phi5L,
+        phi6,
+        phi6L,
+        phi7,
+        phi8,
+        phi8L,
+        sigma1,
+        sigma2,
+        sigma3,
+        sigma4,
+    ) = insp_coeffs
+    (
+        x,
+        x_13,
+        x_23,
+        inv_x,
+        inv_x2,
+        _,
+        _,
+        inv_x_13,
+        inv_x_23,
+        inv_x_43,
+        inv_x_53,
+        inv_x_73,
+        inv_x_83,
+        log_x,
+    ) = powers
+
+    # d/df [phi_TF2(f) * f**(-5/3)]
+    dphi_TF2_ov_f53 = (
+        -(5.0 / 3.0) * phi0 * inv_x_83
+        - (4.0 / 3.0) * phi1 * inv_x_73
+        - phi2 * inv_x2
+        - (2.0 / 3.0) * phi3 * inv_x_53
+        - (1.0 / 3.0) * phi4 * inv_x_43
+        + phi5L * inv_x
+        + (1.0 / 3.0) * phi6 * inv_x_23
+        + phi6L * inv_x_23 * (1.0 + log_x / 3.0)
+        + (2.0 / 3.0) * phi7 * inv_x_13
+        + phi8
+        + phi8L * (1.0 + log_x)
+    )
+
+    # d/df [sigma1 f + sigma2 f**(4/3) + sigma3 f**(5/3) + sigma4 f**2]
+    dphi_sigma = (
+        sigma1
+        + (4.0 / 3.0) * sigma2 * x_13
+        + (5.0 / 3.0) * sigma3 * x_23
+        + 2.0 * sigma4 * x
+    )
+
+    return phiN * (dphi_TF2_ov_f53 + dphi_sigma)
+
+
+def _intermediate_raw_d_phase(
+    powers,
+    int_coeffs,
+    cL: FloatLike,
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Analytic derivative d(Phi_Int_raw)/d(fM_s) of get_intermediate_raw_phase.
+    Takes the shared power bundle from _fractional_powers.
+    """
+    b0, b1, b2, b3, b4, fMs_RD, fMs_damp = int_coeffs
+    (x, _, _, inv_x, inv_x2, inv_x3, inv_x4, _, _, _, _, _, _, _) = powers
+    return (
+        b0
+        + b1 * inv_x
+        + b2 * inv_x2
+        + b3 * inv_x3
+        + b4 * inv_x4
+        + cL / (fMs_damp**2.0 + (x - fMs_RD) ** 2.0 / 4.0)
+    )
+
+
+def _mergerringdown_raw_d_phase(
+    powers,
+    mrd_coeffs,
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Analytic derivative d(Phi_MRD_raw)/d(fM_s) of the raw merger-ringdown phase.
+    Takes the shared power bundle from _fractional_powers.
+    """
+    c0, c1, c2, c4, cL, _, fMs_RD, fMs_damp = mrd_coeffs
+    (x, _, _, _, inv_x2, _, inv_x4, inv_x_13, _, _, _, _, _, _) = powers
+    return (
+        c0
+        + c1 * inv_x_13
+        + c2 * inv_x2
+        + c4 * inv_x4
+        + cL / (fMs_damp**2.0 + (x - fMs_RD) ** 2.0)
+    )
 
 
 def Phase(
@@ -832,7 +1073,22 @@ def PhaseDerivative(
 ) -> Float[Array, " n_freq"]:
     """
     Compute d Phase / d f for IMRPhenomXAS using the same piecewise construction
-    as Phase(), but without differentiating through the final Heaviside assembly.
+    as Phase(), but evaluating the derivative analytically from the collocation
+    coefficients (the analogue of PhaseCoefficients.compute_d_phase in tiwave)
+    instead of differentiating through the Heaviside assembly.
+
+    Inspiral:      phiN * d/df [phi_TF2(f) f^(-5/3) + sigma1 f + sigma2 f^(4/3)
+                   + sigma3 f^(5/3) + sigma4 f^2]
+    Intermediate:  b0 + b1/f + b2/f^2 + b3/f^3 + b4/f^4
+                   + cL / (f_damp^2 + (f - f_ring)^2 / 4) + alpha1
+    Ringdown:      c0 + c1 f^(-1/3) + c2/f^2 + c4/f^4
+                   + cL / (f_damp^2 + (f - f_ring)^2) + beta1
+
+    The fractional powers and log of fM_s are evaluated once and shared between
+    the three pieces instead of being recomputed per piece over the whole grid.
+    The pieces are combined with the same Heaviside windows as Phase(). The
+    high-frequency cutoff fM_CUT is deliberately NOT applied here, so that
+    callers (e.g. NRTidalv3) can evaluate the derivative beyond the cutoff.
     """
 
     m1, m2, chi1, chi2 = theta
@@ -851,54 +1107,41 @@ def PhaseDerivative(
     f1_Ms = fMs_INmatch - 1.0 * deltafMs
     f2_Ms = fMs_IMmatch + 0.5 * deltafMs
 
-    phi_Ins_match_f1, dphi_Ins_match_f1 = jax.value_and_grad(get_inspiral_phase)(
-        f1_Ms, theta, phase_coeffs
-    )
-    _phi_MRD_match_f2, dphi_MRD_match_f2 = jax.value_and_grad(
-        get_mergerringdown_raw_phase, has_aux=True
-    )(f2_Ms, theta, phase_coeffs, chip)
-    _phi_MRD_match_f2, (cL, CV_phase_RD0) = get_mergerringdown_raw_phase(
-        f2_Ms, theta, phase_coeffs, chip
-    )
+    # Scalar collocation coefficients for the three phase pieces
+    insp_coeffs = _get_inspiral_phase_coeffs(theta, phase_coeffs)
+    mrd_coeffs = _get_mergerringdown_raw_phase_coeffs(theta, phase_coeffs, chip)
+    cL = mrd_coeffs[4]
+    CV_phase_RD0 = mrd_coeffs[5]
 
-    phi_Int_match_f1, dphi_Int_match_f1 = jax.value_and_grad(
-        get_intermediate_raw_phase
-    )(f1_Ms, theta, phase_coeffs, dphi_Ins_match_f1, CV_phase_RD0, cL, chip)
+    # C1 continuity corrections (same construction as in Phase())
+    powers_f1 = _fractional_powers(f1_Ms)
+    powers_f2 = _fractional_powers(f2_Ms)
+    dphi_Ins_match_f1 = _inspiral_d_phase(powers_f1, insp_coeffs)
+    dphi_MRD_match_f2 = _mergerringdown_raw_d_phase(powers_f2, mrd_coeffs)
+
+    int_coeffs = _get_intermediate_raw_phase_coeffs(
+        theta, phase_coeffs, dphi_Ins_match_f1, CV_phase_RD0, cL, chip
+    )
+    dphi_Int_match_f1 = _intermediate_raw_d_phase(powers_f1, int_coeffs, cL)
     alpha1 = dphi_Ins_match_f1 - dphi_Int_match_f1
-    alpha0 = phi_Ins_match_f1 - phi_Int_match_f1 - alpha1 * f1_Ms
 
-    phi_Int_func = lambda fM_s_: (
-        get_intermediate_raw_phase(
-            fM_s_, theta, phase_coeffs, dphi_Ins_match_f1, CV_phase_RD0, cL, chip
-        )
-        + alpha1 * fM_s_
-        + alpha0
-    )
-
-    _phi_Int_match_f2, dphi_Int_match_f2 = jax.value_and_grad(phi_Int_func)(f2_Ms)
+    dphi_Int_match_f2 = _intermediate_raw_d_phase(powers_f2, int_coeffs, cL) + alpha1
     beta1 = dphi_Int_match_f2 - dphi_MRD_match_f2
 
-    dphi_Ins = jax.vmap(jax.grad(get_inspiral_phase), in_axes=(0, None, None))(
-        fM_s, theta, phase_coeffs
-    )
-    dphi_Int = jax.vmap(jax.grad(phi_Int_func))(fM_s)
-    dphi_MRD = (
-        jax.vmap(
-            jax.grad(
-                lambda x: get_mergerringdown_raw_phase(x, theta, phase_coeffs, chip)[0]
-            )
-        )(fM_s)
-        + beta1
-    )
+    # Fractional powers/log evaluated once and shared by all three pieces, so
+    # no derivative is evaluated over the frequency range of another piece.
+    powers = _fractional_powers(fM_s)
+    dphi_Ins = _inspiral_d_phase(powers, insp_coeffs) / eta
+    dphi_Int = (_intermediate_raw_d_phase(powers, int_coeffs, cL) + alpha1) / eta
+    dphi_MRD = (_mergerringdown_raw_d_phase(powers, mrd_coeffs) + beta1) / eta
 
-    dphase_dMf = jnp.where(
-        fM_s < f1_Ms,
-        dphi_Ins / eta,
-        jnp.where(
-            fM_s < f2_Ms,
-            dphi_Int / eta,
-            dphi_MRD / eta,
-        ),
+    # Same Heaviside-window assembly as Phase() (no fM_CUT window, see docstring)
+    dphase_dMf = (
+        dphi_Ins * jnp.heaviside(f1_Ms - fM_s, 0.5)
+        + jnp.heaviside(fM_s - f1_Ms, 0.5)
+        * dphi_Int
+        * jnp.heaviside(f2_Ms - fM_s, 0.5)
+        + dphi_MRD * jnp.heaviside(fM_s - f2_Ms, 0.5)
     )
     return dphase_dMf * M_s
 
@@ -1589,7 +1832,9 @@ def gen_IMRPhenomXAS_hphctf(
     hc : array
         Cross polarization strain.
     tf : array
-        Time-frequency array [s] (tf = -dPsi/df / (2*PI)).
+        Time-frequency array [s] (tf = -dPsi/df / (2*PI)). Above the
+        high-frequency cutoff fM_CUT / M_s the amplitude vanishes and tf is
+        set to tc, matching tiwave's IMRPhenomXAS.
     """
     mchirp, eta = params[0], params[1]
     chi1, chi2 = params[2], params[3]
@@ -1613,9 +1858,9 @@ def gen_IMRPhenomXAS_hphctf(
         m1, m2, chi1, chi2
     )
 
-    Psi_base = Phase(f, theta_intrinsic, phase_coeffs)          # raw piecewise phase
-    dphase_df = PhaseDerivative(f, theta_intrinsic, phase_coeffs)  # d(Phase)/df
-    Psi_ref = Phase(f_ref, theta_intrinsic, phase_coeffs)       # Phase at f_ref
+    Psi_base = Phase(f, theta_intrinsic, phase_coeffs)  # raw piecewise phase
+    dphase_df = PhaseDerivative(f, theta_intrinsic, phase_coeffs)  # analytic d(Phase)/df
+    Psi_ref = Phase(f_ref, theta_intrinsic, phase_coeffs)  # Phase at f_ref
     Amp_arr = Amp(f, theta_intrinsic, amp_coeffs, D=dL)  # full amplitude
 
     lina, linb, psi4tostrain = IMRPhenomX_utils.calc_phaseatpeak(
@@ -1638,6 +1883,12 @@ def gen_IMRPhenomXAS_hphctf(
     h22 = Amp_arr * jnp.exp(1j * Psi_full)
     hp = -h22 * (1 / 2 * (1 + jnp.cos(iota) ** 2))
     hc = 1j * h22 * jnp.cos(iota)
-    tf = -(dphase_df + linb * M_s) / (2.0 * PI) + tc
+    # Mirror tiwave: above the high-frequency cutoff the amplitude is zero and
+    # the time-frequency array is set to tc.
+    tf = jnp.where(
+        f * M_s < IMRPhenomX_utils.fM_CUT,
+        -(dphase_df + linb * M_s) / (2.0 * PI) + tc,
+        tc,
+    )
 
     return hp, hc, tf
