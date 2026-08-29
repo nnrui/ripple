@@ -878,25 +878,27 @@ def PhaseDerivative(
     _phi_Int_match_f2, dphi_Int_match_f2 = jax.value_and_grad(phi_Int_func)(f2_Ms)
     beta1 = dphi_Int_match_f2 - dphi_MRD_match_f2
 
-    dphi_Ins = jax.grad(get_inspiral_phase)(fM_s, theta, phase_coeffs)
-    dphi_Int = jax.grad(phi_Int_func)(fM_s)
+    dphi_Ins = jax.vmap(jax.grad(get_inspiral_phase), in_axes=(0, None, None))(
+        fM_s, theta, phase_coeffs
+    )
+    dphi_Int = jax.vmap(jax.grad(phi_Int_func))(fM_s)
     dphi_MRD = (
-        jax.grad(
-            lambda x: get_mergerringdown_raw_phase(x, theta, phase_coeffs, chip)[0]
+        jax.vmap(
+            jax.grad(
+                lambda x: get_mergerringdown_raw_phase(x, theta, phase_coeffs, chip)[0]
+            )
         )(fM_s)
         + beta1
     )
 
-    dphase_dMf = jax.lax.cond(
+    dphase_dMf = jnp.where(
         fM_s < f1_Ms,
-        lambda _: dphi_Ins / eta,
-        lambda _: jax.lax.cond(
+        dphi_Ins / eta,
+        jnp.where(
             fM_s < f2_Ms,
-            lambda __: dphi_Int / eta,
-            lambda __: dphi_MRD / eta,
-            operand=None,
+            dphi_Int / eta,
+            dphi_MRD / eta,
         ),
-        operand=None,
     )
     return dphase_dMf * M_s
 
@@ -1548,3 +1550,94 @@ def gen_IMRPhenomXAS_hphc(
     hc = 1j * h22 * jnp.cos(iota)
 
     return hp, hc
+
+
+def gen_IMRPhenomXAS_hphctf(
+    f: Float[Array, " n_freq"], params: Float[Array, "8"], f_ref: float
+) -> tuple[
+    Complex[Array, " n_freq"], Complex[Array, " n_freq"], Float[Array, " n_freq"]
+]:
+    """
+    Generate PhenomXAS frequency domain waveform plus/cross polarizations
+    and the time-frequency (group delay) array.
+
+    All shared quantities (Phase, PhaseDerivative, Amp, alignment terms) are
+    computed once to avoid redundant work.
+
+    Parameters
+    ----------
+    f : array
+        Frequency array [Hz].
+    params : array
+        Waveform parameters:
+        [Mchirp, eta, chi1, chi2, D, tc, phic, inclination]
+        Mchirp : Chirp mass [solar masses]
+        eta   : Symmetric mass ratio [0, 0.25]
+        chi1  : Aligned spin of primary [-1, 1]
+        chi2  : Aligned spin of secondary [-1, 1]
+        D     : Luminosity distance [Mpc]
+        tc    : Time of coalescence [s]
+        phic  : Phase of coalescence [rad]
+        inclination : Inclination angle [0, PI]
+    f_ref : float
+        Reference frequency [Hz].
+
+    Returns
+    -------
+    hp : array
+        Plus polarization strain.
+    hc : array
+        Cross polarization strain.
+    tf : array
+        Time-frequency array [s] (tf = -dPsi/df / (2*PI)).
+    """
+    mchirp, eta = params[0], params[1]
+    chi1, chi2 = params[2], params[3]
+    dL, tc, phic, iota = params[4], params[5], params[6], params[7]
+    m1, m2 = Mc_eta_to_ms(jnp.array([mchirp, eta]))
+    theta_intrinsic = jnp.array([m1, m2, chi1, chi2])
+
+    phase_coeffs = IMRPhenomX_utils.PhenomX_phase_coeff_table
+    amp_coeffs = IMRPhenomX_utils.PhenomX_amp_coeff_table
+
+    m1_s = m1 * MTSUN
+    m2_s = m2 * MTSUN
+    M_s = m1_s + m2_s
+    delta = jnp.sqrt(jnp.maximum(1.0 - 4.0 * eta, 0.0))
+    mm1 = 0.5 * (1.0 + delta)
+    mm2 = 0.5 * (1.0 - delta)
+    StotR = (mm1**2 * chi1 + mm2**2 * chi2) / (mm1**2 + mm2**2)
+    chia = chi1 - chi2
+
+    fMs_RD, fMs_damp, _, _ = IMRPhenomX_utils.get_cutoff_fMs(
+        m1, m2, chi1, chi2
+    )
+
+    Psi_base = Phase(f, theta_intrinsic, phase_coeffs)          # raw piecewise phase
+    dphase_df = PhaseDerivative(f, theta_intrinsic, phase_coeffs)  # d(Phase)/df
+    Psi_ref = Phase(f_ref, theta_intrinsic, phase_coeffs)       # Phase at f_ref
+    Amp_arr = Amp(f, theta_intrinsic, amp_coeffs, D=dL)  # full amplitude
+
+    lina, linb, psi4tostrain = IMRPhenomX_utils.calc_phaseatpeak(
+        eta, StotR, chia, delta
+    )
+    dphi22Ref = (
+        jax.grad(Phase)((fMs_RD - fMs_damp) / M_s, theta_intrinsic, phase_coeffs)
+        / M_s
+    )
+    linb = linb - dphi22Ref - 2.0 * PI * (500.0 + psi4tostrain)
+
+    phifRef = (
+        -(Psi_ref + linb * (f_ref * M_s) + lina) + PI / 4.0
+    )
+    ext_phase_contrib = 2.0 * PI * f * tc + 2 * phic
+    Psi_full = (
+        Psi_base + (linb * f * M_s) + lina + phifRef - 2.0 * PI + ext_phase_contrib
+    )
+
+    h22 = Amp_arr * jnp.exp(1j * Psi_full)
+    hp = -h22 * (1 / 2 * (1 + jnp.cos(iota) ** 2))
+    hc = 1j * h22 * jnp.cos(iota)
+    tf = -(dphase_df + linb * M_s) / (2.0 * PI) + tc
+
+    return hp, hc, tf
