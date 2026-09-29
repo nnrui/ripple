@@ -1719,7 +1719,7 @@ def _gen_IMRPhenomXAS(
         -(Phase(f_ref, theta_intrinsic, phase_coeffs) + linb * (f_ref * M_s) + lina)
         + PI / 4.0
     )
-    ext_phase_contrib = 2.0 * PI * f * theta_extrinsic[1] + 2 * theta_extrinsic[2]
+    ext_phase_contrib = -2.0 * PI * f * theta_extrinsic[1] + 2 * theta_extrinsic[2]
     Psi = Psi + (linb * fM_s) + lina + phifRef - 2 * PI + ext_phase_contrib
 
     A = Amp(f, theta_intrinsic, amp_coeffs, D=theta_extrinsic[0])
@@ -1875,7 +1875,9 @@ def gen_IMRPhenomXAS_hphctf(
     phifRef = (
         -(Psi_ref + linb * (f_ref * M_s) + lina) + PI / 4.0
     )
-    ext_phase_contrib = 2.0 * PI * f * tc + 2 * phic
+    # Time of coalescence: h(tc) = h(0) * exp(-2*pi*i*f*tc), consistent with
+    # tf = tf(0) + tc below (and with the pespace detector response).
+    ext_phase_contrib = -2.0 * PI * f * tc + 2 * phic
     Psi_full = (
         Psi_base + (linb * f * M_s) + lina + phifRef - 2.0 * PI + ext_phase_contrib
     )
