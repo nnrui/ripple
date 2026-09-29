@@ -13,7 +13,7 @@ The 22-mode reuses ripple's existing IMRPhenomXAS.py (Phase + Amp functions).
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -25,6 +25,10 @@ from ripplegw.waveforms.IMRPhenomXAS import (
     get_mergerringdown_Amp,
     Phase as IMRPhenomXAS_Phase,
     Amp as IMRPhenomXAS_Amp,
+    PhaseDerivative as IMRPhenomXAS_PhaseDerivative,
+    _fractional_powers as _xas_fractional_powers,
+    _inspiral_d_phase as _xas_inspiral_d_phase,
+    _get_inspiral_phase_coeffs as _xas_get_inspiral_phase_coeffs,
 )
 from ripplegw.waveforms import IMRPhenomX_utils
 from ripplegw.constants import PI, MTSUN, MPC, C, MRSUN
@@ -2035,23 +2039,63 @@ def _xhm_s2s_complex(
     return jnp.conj(mu322) * wf22R + jnp.conj(mu323) * amplm * jnp.exp(1j * philm)
 
 
-def _compute_32_hlm(
-    freqs_geom: Float[Array, " n_freq"],
+@dataclass
+class XHM32MixCoefficients:
+    """All coefficients of the (3,2) mode with spheroidal-to-spherical mixing.
+
+    Produced by :func:`_xhm_32_mixing_coefficients` and shared by
+    :func:`_xhm_32_hlm` (waveform) and :func:`_xhm_32_dphase` (time-frequency),
+    so that both use exactly the same coefficients and the same S2S mixing
+    function.
+    """
+
+    emm: int
+    # amplitude-side boundaries and coefficients
+    fIN: FloatLike
+    fIM: FloatLike
+    inter_c: Array  # 8 coefficients of A(f) = f^(-7/6) * sum_j c_j f^j
+    PNgf: FloatLike
+    pn_coeffs: tuple
+    rho1: FloatLike
+    rho2: FloatLike
+    rho3: FloatLike
+    ampNorm: FloatLike
+    # phase-side boundaries and coefficients
+    fMatchIN: FloatLike
+    fMatchIM: FloatLike
+    c0_ph: FloatLike
+    cL_ph: FloatLike
+    c1_ph: FloatLike
+    c2_ph: FloatLike
+    c4_ph: FloatLike
+    c3_ph: FloatLike
+    C1INSP: FloatLike
+    CINSP: FloatLike
+    C1RD: FloatLike
+    CRD: FloatLike
+    deltaphiLM: FloatLike
+    fRING: FloatLike
+    fDAMP: FloatLike
+    # callables: inspiral phase ansatz and the spheroidal-to-spherical transform
+    ins_phase: Callable
+    s2s: Callable
+
+
+def _xhm_32_mixing_coefficients(
     pWFHM: "XHMWaveformStruct",
     pWF22: dict[str, Any],
     t0: FloatLike,
     phifRef: FloatLike,
-    phi0: FloatLike,
-) -> Complex[Array, " n_freq"]:
-    """Evaluate complex h_{3,2}(f) with spheroidal mode mixing (version 122019).
+) -> XHM32MixCoefficients:
+    """Solve all coefficients of the (3,2) mode with spheroidal mode mixing.
 
-    Three-region piecewise:
+    Three-region piecewise (version 122019):
       Inspiral (Mf < fMatchIN):   standard XHM inspiral amplitude + phase
       Intermediate (fMatchIN <= Mf < fMatchIM): polynomial amplitude + 6-coeff phase
       Ringdown (Mf >= fMatchIM):  |S2S|*f^(-7/6)*ampNorm + arg(S2S) + C1RD*f + CRD
 
-    Returns hlm without the external exp(i*(emm/2*phifRef + emm*phi0)) factor
-    (that is applied by the caller in XLALSimIMRPhenomXHMGethlmModes).
+    The returned bundle is consumed by :func:`_xhm_32_hlm` and
+    :func:`_xhm_32_dphase`.
     """
     eta = pWF22["eta"]
     STotR = pWF22["STotR"]
@@ -2468,15 +2512,74 @@ def _compute_32_hlm(
     CRD = inter_phi_fIM - phi0RD - C1RD * fMatchIM
 
     # -----------------------------------------------------------------------
-    # Step 8: Evaluate hlm at all frequencies
+    # Step 8: Bundle the coefficients for the waveform / time-frequency evaluation
     # -----------------------------------------------------------------------
+    return XHM32MixCoefficients(
+        emm=emm,
+        fIN=fIN,
+        fIM=fIM,
+        inter_c=inter_c_32,
+        PNgf=PNgf,
+        pn_coeffs=pn_coeffs,
+        rho1=rho1,
+        rho2=rho2,
+        rho3=rho3,
+        ampNorm=ampNorm,
+        fMatchIN=fMatchIN,
+        fMatchIM=fMatchIM,
+        c0_ph=c0_ph,
+        cL_ph=cL_ph,
+        c1_ph=c1_ph,
+        c2_ph=c2_ph,
+        c4_ph=c4_ph,
+        c3_ph=c3_ph,
+        C1INSP=C1INSP,
+        CINSP=CINSP,
+        C1RD=C1RD,
+        CRD=CRD,
+        deltaphiLM=deltaphiLM,
+        fRING=fRING32,
+        fDAMP=fDAMP32,
+        ins_phase=ins_phase,
+        s2s=s2s,
+    )
+
+
+def _xhm_32_hlm(
+    freqs_geom: Float[Array, " n_freq"],
+    p: XHM32MixCoefficients,
+    phi0: FloatLike,
+) -> Complex[Array, " n_freq"]:
+    """Evaluate complex h_{3,2}(f) with spheroidal mode mixing (version 122019).
+
+    Uses the coefficients from :func:`_xhm_32_mixing_coefficients`. Returns hlm
+    without the external exp(i*(emm/2*phifRef + emm*phi0)) factor (that is
+    applied by the caller in XLALSimIMRPhenomXHMGethlmModes).
+    """
+    emm = p.emm
+    fIN, fIM = p.fIN, p.fIM
+    fMatchIN, fMatchIM = p.fMatchIN, p.fMatchIM
+    fRING32, fDAMP32 = p.fRING, p.fDAMP
+    C1INSP, CINSP, C1RD, CRD = p.C1INSP, p.CINSP, p.C1RD, p.CRD
+    deltaphiLM = p.deltaphiLM
+    s2s = p.s2s
+    nC_32 = len(p.inter_c)
+
     def phase_ins(Mf):
-        return ins_phase(Mf) + C1INSP * Mf + CINSP + deltaphiLM
+        return p.ins_phase(Mf) + C1INSP * Mf + CINSP + deltaphiLM
 
     def phase_inter(Mf):
         return (
             _xhm_inter_phase_ansatz_int_6(
-                Mf, c0_ph, cL_ph, c1_ph, c2_ph, c4_ph, c3_ph, fRING32, fDAMP32
+                Mf,
+                p.c0_ph,
+                p.cL_ph,
+                p.c1_ph,
+                p.c2_ph,
+                p.c4_ph,
+                p.c3_ph,
+                fRING32,
+                fDAMP32,
             )
             + deltaphiLM
         )
@@ -2485,11 +2588,13 @@ def _compute_32_hlm(
         return jnp.angle(s2s(Mf)) + C1RD * Mf + CRD + deltaphiLM
 
     def amp_ins(Mf) -> FloatLike:
-        v = _xhm_insp_rescaled(Mf, PNgf, pn_coeffs, rho1, rho2, rho3, fIN)
-        return ampNorm * Mf ** (-7.0 / 6.0) * v
+        v = _xhm_insp_rescaled(
+            Mf, p.PNgf, p.pn_coeffs, p.rho1, p.rho2, p.rho3, fIN
+        )
+        return p.ampNorm * Mf ** (-7.0 / 6.0) * v
 
     def amp_inter(Mf) -> FloatLike:
-        c = inter_c_32
+        c = p.inter_c
         poly = sum(c[j] * Mf**j for j in range(nC_32))
         return Mf ** (-7.0 / 6.0) * poly
 
@@ -2510,6 +2615,64 @@ def _compute_32_hlm(
         return amp * jnp.exp(1j * (ph - emm * phi0))
 
     return jax.vmap(hlm_at)(freqs_geom)
+
+
+def _compute_32_hlm(
+    freqs_geom: Float[Array, " n_freq"],
+    pWFHM: "XHMWaveformStruct",
+    pWF22: dict[str, Any],
+    t0: FloatLike,
+    phifRef: FloatLike,
+    phi0: FloatLike,
+) -> Complex[Array, " n_freq"]:
+    """Evaluate complex h_{3,2}(f) with spheroidal mode mixing (version 122019).
+
+    Thin wrapper around :func:`_xhm_32_mixing_coefficients` and
+    :func:`_xhm_32_hlm`.
+    """
+    return _xhm_32_hlm(
+        freqs_geom, _xhm_32_mixing_coefficients(pWFHM, pWF22, t0, phifRef), phi0
+    )
+
+
+def _xhm_32_dphase(
+    Mf: Float[Array, " n_freq"],
+    p: XHM32MixCoefficients,
+    pWFHM: "XHMWaveformStruct",
+    pWF22: dict[str, Any],
+) -> Float[Array, " n_freq"]:
+    """
+    Time-frequency derivative d(arg h_32)/d(Mf) of the (3,2) mode.
+
+    Inspiral and intermediate regions are differentiated analytically from the
+    same ansatze as the waveform:
+      Mf < fMatchIN            -> (1/eta)*phi_ins'(2*Mf/emm) + LambdaPN + C1INSP
+      fMatchIN <= Mf < fMatchIM -> derivative of the 6-coefficient ansatz
+    In the ringdown region the mode is built by mixing the spheroidal (3,2) mode
+    with the 22-mode ringdown, i.e. arg(S2S(Mf)) has no simple closed form, so
+    that piece is obtained by automatic differentiation of the *same* S2S
+    function used to build the waveform:
+      Mf >= fMatchIM           -> d/dMf[arg(S2S(Mf))] + C1RD
+    """
+    dphi_ins = _xhm_inspiral_dphase_lm(Mf, pWFHM, pWF22) + p.C1INSP
+
+    dphi_inter = _xhm_inter_phase_ansatz_deriv_6(
+        Mf,
+        p.c0_ph,
+        p.cL_ph,
+        p.c1_ph,
+        p.c2_ph,
+        p.c4_ph,
+        p.c3_ph,
+        p.fRING,
+        p.fDAMP,
+    )
+
+    dphi_rd = jax.vmap(jax.grad(lambda x: jnp.angle(p.s2s(x))))(Mf) + p.C1RD
+
+    return jnp.where(
+        Mf < p.fMatchIN, dphi_ins, jnp.where(Mf < p.fMatchIM, dphi_inter, dphi_rd)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2906,6 +3069,81 @@ def xhm_phase_noModeMixing(
 
     # Global phase normalization
     return phi + pPhase.deltaphiLM
+
+
+def _xhm_inspiral_dphase_lm(
+    Mf: Float[Array, " n_freq"] | FloatLike,
+    pWFHM: XHMWaveformStruct,
+    pWF22: dict[str, Any],
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Analytic d/d(Mf) of the inspiral phase ansatz of one higher mode:
+
+        d/dMf [ (emm/2)/eta * phi_ins(2*Mf/emm) + LambdaPN*Mf ]
+          = (1/eta) * phi_ins'(2*Mf/emm) + LambdaPN
+
+    phi_ins' is the analytic derivative of the raw XAS inspiral phase
+    (IMRPhenomXAS._inspiral_d_phase on the shared fractional-power bundle), so no
+    autodiff is needed for the inspiral region.
+    """
+    emm = pWFHM.emm
+    eta = pWF22["eta"]
+    insp_coeffs = _xas_get_inspiral_phase_coeffs(
+        pWF22["theta"], pWF22["phase_coeffs"]
+    )
+    return (
+        _xas_inspiral_d_phase(
+            _xas_fractional_powers(2.0 * Mf / emm), insp_coeffs
+        )
+        / eta
+        + _xhm_insp_phase_LambdaPN(pWFHM.modeTag, eta)
+    )
+
+
+def xhm_dphase_noModeMixing(
+    Mf: Float[Array, " n_freq"] | FloatLike,
+    pPhase: XHMPhaseCoefficients,
+    pWFHM: XHMWaveformStruct,
+    pWF22: dict[str, Any],
+) -> Float[Array, " n_freq"] | FloatLike:
+    """
+    Analytic derivative d(phi_lm)/d(Mf) of xhm_phase_noModeMixing (21, 33, 44).
+
+    Same three-region piecewise construction as xhm_phase_noModeMixing, with each
+    region differentiated analytically:
+      Mf < fMatchIN            -> (1/eta)*phi_ins'(2*Mf/emm) + LambdaPN + C1INSP
+      fMatchIN <= Mf < fMatchIM -> d/dMf of the intermediate phase ansatz
+      Mf >= fMatchIM           -> d/dMf of the ringdown phase ansatz
+
+    The constant deltaphiLM (mode alignment) drops out of the derivative. Uses
+    jnp.where for the region switch, so all three regions are evaluated
+    everywhere, as in xhm_phase_noModeMixing.
+    """
+    fMatchIN = pPhase.fMatchIN
+    fMatchIM = pPhase.fMatchIM
+    fRING = pPhase.fRING
+    fDAMP = pPhase.fDAMP
+
+    dphi_ins = _xhm_inspiral_dphase_lm(Mf, pWFHM, pWF22) + pPhase.ins_C1INSP
+
+    dphi_inter = _xhm_inter_phase_ansatz_deriv(
+        Mf,
+        pPhase.inter_c0,
+        pPhase.inter_c1,
+        pPhase.inter_c2,
+        pPhase.inter_c4,
+        pPhase.inter_cL,
+        fRING,
+        fDAMP,
+    )
+
+    dphi_ring = _xhm_rd_phase_ansatz_deriv(
+        Mf, pPhase.rd_C1RD, pPhase.rd_alpha2, pPhase.rd_alphaL, fRING, fDAMP
+    )
+
+    return jnp.where(
+        Mf < fMatchIN, dphi_ins, jnp.where(Mf < fMatchIM, dphi_inter, dphi_ring)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6716,6 +6954,31 @@ def XLALSimIMRPhenomXHMGethlmModes(
     return hlm_dict
 
 
+_XHM_SMINUS2 = {2: compute_sminus2_l2, 3: compute_sminus2_l3, 4: compute_sminus2_l4}
+
+
+def _xhm_harmonic_factors(iota: FloatLike, ell: int, emm: int):
+    """
+    Polarization factors mapping one mode hlm to hp/hc:
+
+      Ym      = Y_{l,-m}^{-2}(iota, pi/2) = F_{l,-m}(iota) * (-i)^m
+      Ystar   = conj(Y_{l,m}^{-2}(iota, pi/2)) = F_{lm}(iota) * (-i)^m
+      minus1l = (-1)^l
+      factorp = 0.5 * (Ym + minus1l * Ystar)
+      factorc = 0.5j * (Ym - minus1l * Ystar)
+
+    Source: IMRPhenomXHMFDAddMode (LALSimIMRPhenomXHM.c).
+    """
+    minus1l = 1 if ell % 2 == 0 else -1
+    Ylm_fn = _XHM_SMINUS2[ell]
+    F_neg = Ylm_fn(iota, -emm)  # F_{l,-m}(iota) — real
+    F_pos = Ylm_fn(iota, emm)  # F_{l,+m}(iota) — real
+    neg_im = (-1j) ** emm  # (-i)^m = exp(-i*m*pi/2)
+    factorp = 0.5 * neg_im * (F_neg + minus1l * F_pos)
+    factorc = 0.5j * neg_im * (F_neg - minus1l * F_pos)
+    return factorp, factorc
+
+
 def gen_IMRPhenomXHM_hphc(
     freqs: Float[Array, " n_freq"],
     theta: Float[Array, "8"],
@@ -6766,8 +7029,6 @@ def gen_IMRPhenomXHM_hphc(
         freqs_geom, pWF22, phi0=phi_ref, ell_mm_pairs=ell_mm_pairs
     )
 
-    _sminus2 = {2: compute_sminus2_l2, 3: compute_sminus2_l3, 4: compute_sminus2_l4}
-
     hp = jnp.zeros(len(freqs), dtype=jnp.complex128)
     hc = jnp.zeros(len(freqs), dtype=jnp.complex128)
 
@@ -6775,13 +7036,161 @@ def gen_IMRPhenomXHM_hphc(
         # LAL applies (-1)^l to Amp0 for odd-l modes (LALSimIMRPhenomXHM.c line 601-604).
         minus1l = 1 if ell % 2 == 0 else -1
         hlm = hlm_dict[(ell, emm)] * amp0 * minus1l
-        Ylm_fn = _sminus2[ell]
-        F_neg = Ylm_fn(iota, -emm)  # F_{l,-m}(iota) — real
-        F_pos = Ylm_fn(iota, emm)  # F_{l,+m}(iota) — real
-        neg_im = (-1j) ** emm  # (-i)^m = exp(-i*m*pi/2)
-        factorp = 0.5 * neg_im * (F_neg + minus1l * F_pos)
-        factorc = 0.5j * neg_im * (F_neg - minus1l * F_pos)
+        factorp, factorc = _xhm_harmonic_factors(iota, ell, emm)
         hp = hp + factorp * hlm
         hc = hc + factorc * hlm
 
     return hp, hc
+
+
+def _xhm_parse_mode(mode: str) -> tuple[int, int]:
+    """Parse a mode label such as ``"21"`` or ``"32"`` into ``(ell, m)``."""
+    return int(mode[0]), int(mode[1])
+
+
+def _xhm_higher_modes_dphase(
+    freqs_geom: Float[Array, " n_freq"],
+    pWF22: dict[str, Any],
+    t0: FloatLike,
+    phifRef: FloatLike,
+    modes: tuple[str, ...],
+) -> dict[tuple[int, int], Float[Array, " n_freq"]]:
+    """
+    Per-mode phase derivative d(arg h_lm)/d(Mf) for the higher modes.
+
+    The value of ``t0`` enters through the intermediate collocation values
+    already encoded in the phase coefficients, so no additional linear-in-Mf
+    term is added here (and the mode-alignment constant deltaphiLM and the
+    (m/2)*phifRef reference-phase term are frequency independent, hence drop out
+    of the derivative).
+    """
+    dphase = {}
+    for mode in modes:
+        ell, emm = _xhm_parse_mode(mode)
+        pWFHM = xhm_set_waveform_variables(ell, emm, pWF22)
+        if pWFHM.MixingOn:
+            p_coeffs = _xhm_32_mixing_coefficients(pWFHM, pWF22, t0, phifRef)
+            dphase[(ell, emm)] = _xhm_32_dphase(
+                freqs_geom, p_coeffs, pWFHM, pWF22
+            )
+        else:
+            pPhase = xhm_get_phase_coefficients(pWFHM, pWF22, t0)
+            dphase[(ell, emm)] = xhm_dphase_noModeMixing(
+                freqs_geom, pPhase, pWFHM, pWF22
+            )
+    return dphase
+
+
+def gen_IMRPhenomXHM_hphctf_modes(
+    freqs: Float[Array, " n_freq"],
+    theta: Float[Array, "8"],
+    f_ref: float,
+    modes: tuple[str, ...] = ("21", "33", "32", "44"),
+) -> dict[str, dict[str, Array]]:
+    """
+    Generate per-mode hp, hc and tf for IMRPhenomXHM.
+
+    The modes are returned separately instead of being summed into hp/hc: the
+    detector response is computed mode by mode, since each mode has its own
+    time-frequency relation t(f) (see
+    ``pespace.detector._jax_impl._antenna_jax``).
+
+    Parameters
+    ----------
+    freqs : array
+        Frequency samples in Hz.
+    theta : array
+        ``[m1, m2, chi1z, chi2z, dist_mpc, tc, phi_ref, iota]``
+
+        m1, m2   : component masses in solar masses
+        chi1z/2z : aligned spins [-1, 1]
+        dist_mpc : luminosity distance in Mpc
+        tc       : coalescence time in seconds
+        phi_ref  : orbital phase at the reference frequency [rad]
+        iota     : inclination angle [rad]
+    f_ref : float
+        Reference frequency in Hz.
+    modes : tuple of str, optional
+        Higher modes to include, default ``("21", "33", "32", "44")``; the
+        (2,2) mode is always present.
+
+    Returns
+    -------
+    dict
+        Mode-keyed dict, e.g.
+        ``{"22": {"plus": hp, "cross": hc, "tf": tf}, "21": {...}, ...}``,
+        with complex ``hp``/``hc`` and real ``tf`` of shape ``(N_freq,)``.
+
+    Notes
+    -----
+    - ``tf`` is the group delay ``t(f) = -d(arg h_lm)/df / (2*pi)`` in seconds.
+      It is computed analytically from the phase coefficients of each mode.
+      The exception is the ringdown of the (3,2) mode: there the mode is
+      obtained by transforming the spheroidal mode into the spherical basis
+      (``arg(S2S(f))``), which has no closed-form derivative, so that piece is
+      differentiated automatically from the same mixing function used to build
+      the waveform.
+    - The coalescence time is applied as ``h(f) -> h(f) * exp(-1j*2*pi*f*tc)``
+      and ``tf -> tf + tc`` (the convention used by the detector response in
+      pespace), so pass ``tc = 0`` here when the response applies it.
+    - Above the LAL/tiwave high-frequency cutoff (``fM_CUT = 0.3`` in geometric
+      units, raised to 0.33 for ``chi_eff > 0.99``) ``tf`` is set to ``tc``.
+    """
+    m1, m2 = theta[0], theta[1]
+    chi1z, chi2z = theta[2], theta[3]
+    dist_mpc = theta[4]
+    tc = theta[5]
+    phi_ref = theta[6]
+    iota = theta[7]
+
+    Mtot = m1 + m2  # solar masses
+    M_s = Mtot * MTSUN  # total mass in seconds
+    dist_m = dist_mpc * MPC  # distance in metres
+    amp0 = Mtot * MRSUN * Mtot * MTSUN / dist_m
+
+    freqs_geom = freqs * M_s
+    pWF22 = build_pWF22(m1, m2, chi1z, chi2z, f_ref)
+    t0 = IMRPhenomX_TimeShift_22(pWF22)
+    Mf_ref = pWF22["Mf_ref"]
+    chip = pWF22["chip"]
+    phase_coeffs = pWF22["phase_coeffs"]
+
+    phi_22_at_ref = IMRPhenomXAS_Phase(
+        Mf_ref / M_s, pWF22["theta"], phase_coeffs, chip
+    )
+    phifRef = -phi_22_at_ref - t0 * Mf_ref + 2.0 * phi_ref + PI / 4.0
+
+    ell_mm_pairs = [(2, 2)] + [_xhm_parse_mode(mode) for mode in modes]
+    hlm_dict = XLALSimIMRPhenomXHMGethlmModes(
+        freqs_geom, pWF22, phi0=phi_ref, ell_mm_pairs=ell_mm_pairs
+    )
+
+    # Phase derivative of the 22 mode: the XAS phase plus the global time shift.
+    dphase = {
+        (2, 2): t0
+        + IMRPhenomXAS_PhaseDerivative(freqs, pWF22["theta"], phase_coeffs, chip)
+        / M_s
+    }
+    dphase.update(_xhm_higher_modes_dphase(freqs_geom, pWF22, t0, phifRef, modes))
+
+    # Waveform ends when the LAL/tiwave high-frequency cutoff is reached; beyond
+    # it the group delay is set to tc (no signal, so no time-frequency relation).
+    f_max = jnp.where(pWF22["chi_eff"] > 0.99, 0.33, IMRPhenomX_utils.fM_CUT)
+    tshift = jnp.exp(-1j * 2.0 * PI * freqs * tc)
+
+    waveforms = {}
+    for ell, emm in ell_mm_pairs:
+        # LAL applies (-1)^l to Amp0 for odd-l modes (LALSimIMRPhenomXHM.c line 601-604).
+        minus1l = 1 if ell % 2 == 0 else -1
+        hlm = hlm_dict[(ell, emm)] * amp0 * minus1l
+        factorp, factorc = _xhm_harmonic_factors(iota, ell, emm)
+        tf = jnp.where(
+            freqs_geom < f_max, -dphase[(ell, emm)] * M_s / (2.0 * PI), 0.0
+        )
+        waveforms[f"{ell}{emm}"] = {
+            "plus": factorp * hlm * tshift,
+            "cross": factorc * hlm * tshift,
+            "tf": tf + tc,
+        }
+
+    return waveforms
