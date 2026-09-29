@@ -6890,6 +6890,10 @@ def XLALSimIMRPhenomXHMGethlmModes(
          b. xhm_get_phase_coefficients -> pPhase
          c. xhm_get_amp_coefficients -> pAmp
          d. XLALSimIMRPhenomXHMEvaluateOnehlmMode -> hlm
+      5. Every mode (including (2,2)) is set to exactly zero at/above the
+         high-frequency cutoff Mf >= fMax (fMax = 0.3, or 0.33 when
+         chi_eff > 0.99), matching LAL and tiwave, which only evaluate the
+         modes below it.
     """
     M_s = pWF22["M_s"]
     theta = pWF22["theta"]
@@ -6909,6 +6913,12 @@ def XLALSimIMRPhenomXHMGethlmModes(
     phifRef = -phi_22_at_ref - t0 * Mf_ref + 2.0 * phi0 + PI / 4.0
 
     hlm_dict = {}
+
+    # High-frequency cutoff: LAL (and tiwave) only evaluate the modes for
+    # Mf < fMax and leave them exactly zero above it (fMax = 0.33 instead of
+    # fM_CUT = 0.3 when chi_eff > 0.99, where the 44 ringdown is almost cut
+    # out at 0.3).  This applies to every mode, including (2,2).
+    f_max = jnp.where(pWF22["chi_eff"] > 0.99, 0.33, IMRPhenomX_utils.fM_CUT)
 
     for ell, mm in ell_mm_pairs:
         if ell == 2 and mm == 2:
@@ -6930,26 +6940,33 @@ def XLALSimIMRPhenomXHMGethlmModes(
             # 22 mode: phifRef already encodes 2*phi0, so no extra subtraction needed.
             # LAL: Psi_22 = t0*(f-Mf_ref) + phase_22 - phi_22_at_ref + 2*phi0 + PI/4
             phase_total = t0 * freqs_geom + phase_22 + phifRef
-            hlm_dict[(ell, mm)] = amp_22 * jnp.exp(1j * phase_total)
+            hlm_mode = amp_22 * jnp.exp(1j * phase_total)
         else:
             pWFHM = xhm_set_waveform_variables(ell, mm, pWF22)
             if pWFHM.MixingOn:
                 hlm = _compute_32_hlm(freqs_geom, pWFHM, pWF22, t0, phifRef, phi0)
-                hlm_dict[(ell, mm)] = hlm * jnp.exp(
+                hlm_mode = hlm * jnp.exp(
                     1j * ((mm / 2.0) * phifRef + mm * phi0)
                 )
-                continue
-            pPhase = xhm_get_phase_coefficients(pWFHM, pWF22, t0)
-            pAmp = xhm_get_amp_coefficients(pWFHM, pWF22)
-            hlm = XLALSimIMRPhenomXHMEvaluateOnehlmMode(
-                freqs_geom, pWFHM, pPhase, pAmp, pWF22, t0, phi0
-            )
-            # LAL includes (mm/2)*phiref22 in deltaphiLM (phiref22 = phifRef here),
-            # which expands to (mm/2)*phifRef_const + mm*phi0. Combined with the
-            # -mm*phi0 already in hlm from evaluateOnehlmMode, the net is:
-            #   -mm*phi0 + (mm/2)*phifRef + mm*phi0 = (mm/2)*phifRef_const + mm*phi0
-            # This matches LAL's phi0-dependent mode phases (eq. 2364/2368 LALSimIMRPhenomXHM.c).
-            hlm_dict[(ell, mm)] = hlm * jnp.exp(1j * ((mm / 2.0) * phifRef + mm * phi0))
+            else:
+                pPhase = xhm_get_phase_coefficients(pWFHM, pWF22, t0)
+                pAmp = xhm_get_amp_coefficients(pWFHM, pWF22)
+                hlm = XLALSimIMRPhenomXHMEvaluateOnehlmMode(
+                    freqs_geom, pWFHM, pPhase, pAmp, pWF22, t0, phi0
+                )
+                # LAL includes (mm/2)*phiref22 in deltaphiLM (phiref22 = phifRef here),
+                # which expands to (mm/2)*phifRef_const + mm*phi0. Combined with the
+                # -mm*phi0 already in hlm from evaluateOnehlmMode, the net is:
+                #   -mm*phi0 + (mm/2)*phifRef + mm*phi0 = (mm/2)*phifRef_const + mm*phi0
+                # This matches LAL's phi0-dependent mode phases (eq. 2364/2368 LALSimIMRPhenomXHM.c).
+                hlm_mode = hlm * jnp.exp(
+                    1j * ((mm / 2.0) * phifRef + mm * phi0)
+                )
+
+        # Modes are exactly zero at/above the cutoff (LAL/tiwave skip
+        # evaluating them there; the (2,2) amplitude additionally vanishes
+        # through the PhenomXAS fM_CUT window).
+        hlm_dict[(ell, mm)] = jnp.where(freqs_geom < f_max, hlm_mode, 0.0)
 
     return hlm_dict
 
@@ -7134,7 +7151,8 @@ def gen_IMRPhenomXHM_hphctf_modes(
       and ``tf -> tf + tc`` (the convention used by the detector response in
       pespace), so pass ``tc = 0`` here when the response applies it.
     - Above the LAL/tiwave high-frequency cutoff (``fM_CUT = 0.3`` in geometric
-      units, raised to 0.33 for ``chi_eff > 0.99``) ``tf`` is set to ``tc``.
+      units, raised to 0.33 for ``chi_eff > 0.99``) the mode amplitudes are
+      set to exactly zero and ``tf`` is set to ``tc``.
     """
     m1, m2 = theta[0], theta[1]
     chi1z, chi2z = theta[2], theta[3]
